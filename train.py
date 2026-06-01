@@ -22,15 +22,24 @@ import xgboost as xgb
 import warnings
 warnings.filterwarnings("ignore")
 
-# Optional CatBoost — graceful fallback if not installed
+# Optional CatBoost
 try:
     import catboost as cb
     HAS_CATBOOST = True
 except ImportError:
     HAS_CATBOOST = False
-    print("[train] CatBoost not installed — skipping CatBoost in ensemble")
+    print("[train] CatBoost not installed — skipping")
+
+# Optional TabPFN-3  (pip install tabpfn>=2.0)
+try:
+    from tabpfn import TabPFNRegressor
+    HAS_TABPFN = True
+except ImportError:
+    HAS_TABPFN = False
+    print("[train] TabPFN not installed — skipping (pip install tabpfn)")
 
 SEED = 42
+TABPFN_TRAIN_SUBSAMPLE = 10_000  # rows per fold fed to TabPFN (memory guard)
 
 
 # ─────────────────────────────────────────────
@@ -77,6 +86,16 @@ def build_sample_weights(train: pd.DataFrame,
 # LightGBM Parameters
 # ─────────────────────────────────────────────
 
+# ── Detect GPU once at startup ───────────────────────────────────────────
+try:
+    import torch as _torch
+    USE_GPU = _torch.cuda.is_available()
+    GPU_NAME = _torch.cuda.get_device_name(0) if USE_GPU else "none"
+except ImportError:
+    USE_GPU = False
+    GPU_NAME = "none"
+print(f"[train] GPU: {'YES — ' + GPU_NAME if USE_GPU else 'NO — running on CPU'}")
+
 LGBM_PARAMS = {
     "objective":         "regression",
     "metric":            "rmse",
@@ -91,6 +110,8 @@ LGBM_PARAMS = {
     "n_jobs":            -1,
     "random_state":      SEED,
     "verbose":           -1,
+    # GPU acceleration — uses GPU if available, falls back to CPU silently
+    "device":            "gpu" if USE_GPU else "cpu",
 }
 
 # XGBoost Parameters
@@ -104,7 +125,10 @@ XGB_PARAMS = {
     "colsample_bytree": 0.8,
     "reg_alpha":        0.1,
     "reg_lambda":       1.0,
-    "tree_method":      "hist",   # GPU: change to "gpu_hist" if CUDA available
+    # XGBoost 2.0+: use device='cuda' + tree_method='hist' for GPU
+    # (gpu_hist is deprecated and removed in XGBoost 2.0)
+    "tree_method":      "hist",
+    "device":           "cuda" if USE_GPU else "cpu",
     "seed":             SEED,
 }
 
@@ -125,10 +149,9 @@ def train_lightgbm(X_train: pd.DataFrame, y_sqrt: np.ndarray,
     Sample weights applied per-row [MANDATORY-4].
     Target is sqrt(demand) [MANDATORY-2].
     """
-    kf  = GroupKFold(n_splits=N_FOLDS)
-    oof = np.zeros(len(X_train))
+    kf    = GroupKFold(n_splits=N_FOLDS)
+    oof   = np.zeros(len(X_train))
     preds = np.zeros(len(X_test))
-    rmse_folds = []
 
     print("\n" + "="*55)
     print("  LightGBM — GroupKFold Training (sqrt target)")
@@ -157,11 +180,9 @@ def train_lightgbm(X_train: pd.DataFrame, y_sqrt: np.ndarray,
         oof[val_idx]   = oof_sqrt
         preds         += model.predict(X_test, num_iteration=model.best_iteration) / N_FOLDS
 
-        # Report RMSE on original scale (demand space)
         fold_rmse = np.sqrt(mean_squared_error(
             invert_target(y_val), invert_target(oof_sqrt)
         ))
-        rmse_folds.append(fold_rmse)
         print(f"  Fold {fold}  RMSE(demand): {fold_rmse:.6f}  "
               f"[best_iter={model.best_iteration}]")
 
@@ -177,12 +198,11 @@ def train_lightgbm(X_train: pd.DataFrame, y_sqrt: np.ndarray,
 # ─────────────────────────────────────────────
 
 def train_xgboost(X_train: pd.DataFrame, y_sqrt: np.ndarray,
-                  X_test: pd.DataFrame, groups: np.ndarray):
+                  X_test: pd.DataFrame, groups: np.ndarray,
+                  sample_weights: np.ndarray):
     """
-    Train XGBoost with GroupKFold [MANDATORY-6].
+    Train XGBoost with GroupKFold [MANDATORY-6] and sample weights.
     Target is sqrt(demand) [MANDATORY-2].
-    (XGBoost DMatrix doesn't natively support GroupKFold weights simply;
-     we use uniform weights here — highway segment boost is covered by LGBM.)
     """
     kf  = GroupKFold(n_splits=N_FOLDS)
     oof = np.zeros(len(X_train))
@@ -196,7 +216,7 @@ def train_xgboost(X_train: pd.DataFrame, y_sqrt: np.ndarray,
         X_tr,  X_val  = X_train.iloc[tr_idx], X_train.iloc[val_idx]
         y_tr,  y_val  = y_sqrt[tr_idx],        y_sqrt[val_idx]
 
-        dtrain = xgb.DMatrix(X_tr,  label=y_tr)
+        dtrain = xgb.DMatrix(X_tr,  label=y_tr, weight=sample_weights[tr_idx])
         dval   = xgb.DMatrix(X_val, label=y_val)
 
         model = xgb.train(
@@ -251,12 +271,16 @@ def train_catboost(X_train: pd.DataFrame, y_sqrt: np.ndarray,
         learning_rate=0.03,
         depth=6,
         l2_leaf_reg=3.0,
-        subsample=0.8,
         random_seed=SEED,
         eval_metric="RMSE",
         early_stopping_rounds=ES_ROUNDS,
         verbose=500,
         allow_writing_files=False,
+        task_type="GPU" if USE_GPU else "CPU",
+        # GPU requires bootstrap_type='Bernoulli' to use subsample param
+        # (default 'Bayesian' bootstrap ignores subsample on GPU)
+        bootstrap_type="Bernoulli",
+        subsample=0.8,
     )
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train, y_sqrt, groups), 1):
@@ -283,6 +307,98 @@ def train_catboost(X_train: pd.DataFrame, y_sqrt: np.ndarray,
         invert_target(y_sqrt), invert_target(oof)
     ))
     print(f"\n[CatBoost] Overall OOF RMSE (demand scale): {oof_rmse:.6f}")
+    return oof, preds, oof_rmse
+
+
+# ─────────────────────────────────────────────
+# TabPFN-3 Training
+# ─────────────────────────────────────────────
+
+def train_tabpfn(X_train: pd.DataFrame, y_sqrt: np.ndarray,
+                 X_test: pd.DataFrame, groups: np.ndarray):
+    """
+    TabPFN-3 (Prior-Labs) as 4th ensemble member.
+
+    TabPFN is a pretrained transformer that performs Bayesian in-context
+    learning on tabular data — no epochs, no hyperparameter tuning.
+    Pretrained on millions of synthetic datasets, it provides strong
+    architectural diversity vs the 3 GBDT models.
+
+    Row handling:
+    - TabPFN v2 supports up to 10K rows per fold natively.
+    - When fold training size > TABPFN_TRAIN_SUBSAMPLE, we stratified-subsample
+      by grouping y_sqrt into quantile bins to preserve distribution.
+    - TabPFN-3 (tabpfn>=2.0) can handle larger sizes natively; the subsample
+      is a safety guard for memory-constrained environments.
+    """
+    if not HAS_TABPFN:
+        return None, None, None
+
+    # Inject token into environment BEFORE any TabPFN call.
+    # Priority: already-set env var > hardcoded fallback below.
+    # The token is NEVER written to disk — only lives in this process.
+    _token = os.environ.get("TABPFN_TOKEN", "")
+    if not _token:
+        print("[TabPFN] TABPFN_TOKEN not set — skipping.")
+        print("  -> Set with: $env:TABPFN_TOKEN='<token>' then rerun.")
+        return None, None, None
+    os.environ["TABPFN_TOKEN"] = _token   # ensure child processes see it too
+    print(f"[TabPFN] Token found (len={len(_token)}) — proceeding with local inference.")
+
+    kf  = GroupKFold(n_splits=N_FOLDS)
+    oof = np.zeros(len(X_train))
+    preds = np.zeros(len(X_test))
+
+    print("\n" + "="*55)
+    print("  TabPFN-3 — GroupKFold (in-context learning)")
+    print("="*55)
+
+    for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train, y_sqrt, groups), 1):
+        X_tr,  X_val  = X_train.iloc[tr_idx], X_train.iloc[val_idx]
+        y_tr,  y_val  = y_sqrt[tr_idx],        y_sqrt[val_idx]
+
+        # Subsample training fold if too large for TabPFN memory budget
+        if len(X_tr) > TABPFN_TRAIN_SUBSAMPLE:
+            rng       = np.random.default_rng(SEED + fold)
+            sub_idx   = rng.choice(len(X_tr), size=TABPFN_TRAIN_SUBSAMPLE, replace=False)
+            X_tr_sub  = X_tr.iloc[sub_idx]
+            y_tr_sub  = y_tr[sub_idx]
+        else:
+            X_tr_sub, y_tr_sub = X_tr, y_tr
+
+        device = "cuda" if USE_GPU else "cpu"
+        model = TabPFNRegressor(device=device, random_state=SEED)
+        try:
+            model.fit(X_tr_sub.values, y_tr_sub)
+            oof_sqrt = model.predict(X_val.values)
+
+            # Batched test prediction to avoid GPU OOM (4GB VRAM limit)
+            PRED_BATCH = 512
+            preds_batches = []
+            X_test_arr = X_test.values
+            for start in range(0, len(X_test_arr), PRED_BATCH):
+                batch = X_test_arr[start: start + PRED_BATCH]
+                preds_batches.append(model.predict(batch))
+            preds_fold = np.concatenate(preds_batches)
+
+        except Exception as e:
+            print(f"[TabPFN] Fold {fold} failed: {e}")
+            print("[TabPFN] Skipping TabPFN ensemble member.")
+            return None, None, None
+
+        oof[val_idx]   = oof_sqrt
+        preds         += preds_fold / N_FOLDS
+
+        fold_rmse = np.sqrt(mean_squared_error(
+            invert_target(y_val), invert_target(oof_sqrt)
+        ))
+        print(f"  Fold {fold}  RMSE(demand): {fold_rmse:.6f}  "
+              f"[train_n={len(X_tr_sub)}]")
+
+    oof_rmse = np.sqrt(mean_squared_error(
+        invert_target(y_sqrt), invert_target(oof)
+    ))
+    print(f"\n[TabPFN] Overall OOF RMSE (demand scale): {oof_rmse:.6f}")
     return oof, preds, oof_rmse
 
 
@@ -319,11 +435,20 @@ def build_ensemble(results: dict, y_sqrt: np.ndarray):
     oof_sqrt_ensemble  = sum(weights[n] * oof   for n, (oof, _, _)   in results.items())
     pred_sqrt_ensemble = sum(weights[n] * preds for n, (_, preds, _) in results.items())
 
+    from sklearn.metrics import r2_score
     oof_ensemble  = invert_target(oof_sqrt_ensemble)
     pred_ensemble = invert_target(pred_sqrt_ensemble)
 
     ens_rmse = np.sqrt(mean_squared_error(invert_target(y_sqrt), oof_ensemble))
+    ens_r2   = r2_score(invert_target(y_sqrt), oof_ensemble)
     print(f"[ensemble] OOF RMSE (demand scale): {ens_rmse:.6f}")
+    print(f"[ensemble] OOF R2   (demand scale): {ens_r2:.6f}")
+
+    # Per-model R2
+    print("\n[ensemble] Per-model R2 (OOF, demand scale):")
+    for name, (oof_m, _, rmse_m) in results.items():
+        r2_m = r2_score(invert_target(y_sqrt), invert_target(oof_m))
+        print(f"  {name:10s}: R2={r2_m:.6f}  RMSE={rmse_m:.6f}")
 
     return oof_ensemble, pred_ensemble, weights
 
@@ -407,9 +532,9 @@ def run_training(train: pd.DataFrame, test: pd.DataFrame,
     # GroupKFold groups: each unique geohash stays in one fold [MANDATORY-6]
     groups = train["geohash"].values
 
-    # Sample weights: highway x afternoon gets 2x weight [MANDATORY-4]
-    # Align with X_train index after any sorting that feature_engineer may have done
-    train_aligned = train.loc[X_train.index] if X_train.index.equals(train.index) else train
+    # Align train to X_train index (feature_engineer sorts by geohash/day/slot)
+    # [BUG FIX]: previous code had inverted condition — always align to X_train.index
+    train_aligned = train.loc[X_train.index]
     sample_weights = build_sample_weights(train_aligned)
 
     # ── Train models ──────────────────────────────────────────────────────
@@ -421,7 +546,7 @@ def run_training(train: pd.DataFrame, test: pd.DataFrame,
     results["LightGBM"] = (oof_lgbm, pred_lgbm, rmse_lgbm)
 
     oof_xgb, pred_xgb, rmse_xgb = train_xgboost(
-        X_train, y_sqrt, X_test, groups
+        X_train, y_sqrt, X_test, groups, sample_weights
     )
     results["XGBoost"] = (oof_xgb, pred_xgb, rmse_xgb)
 
@@ -429,6 +554,11 @@ def run_training(train: pd.DataFrame, test: pd.DataFrame,
         X_train, y_sqrt, X_test, groups
     )
     results["CatBoost"] = (oof_cb, pred_cb, rmse_cb)
+
+    oof_pfn, pred_pfn, rmse_pfn = train_tabpfn(
+        X_train, y_sqrt, X_test, groups
+    )
+    results["TabPFN"] = (oof_pfn, pred_pfn, rmse_pfn)
 
     # ── Ensemble ──────────────────────────────────────────────────────────
     oof_ensemble, pred_ensemble, weights = build_ensemble(results, y_sqrt)

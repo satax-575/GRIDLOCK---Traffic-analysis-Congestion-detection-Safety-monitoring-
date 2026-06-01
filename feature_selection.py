@@ -28,8 +28,9 @@ warnings.filterwarnings("ignore")
 # Columns that must never be used as model features
 DROP_ALWAYS = [
     "Index", "geohash", "timestamp", "demand",
-    "geohash_prefix5", "geohash_prefix4",   # raw string prefixes kept for reference
+    "geohash_prefix5", "geohash_prefix4",   # raw string prefixes
     "demand_sqrt",                            # transformed target — not a feature
+    "geohash_mean_temp",                      # intermediate; deviation is the feature
 ]
 
 TARGET_COL       = "demand"

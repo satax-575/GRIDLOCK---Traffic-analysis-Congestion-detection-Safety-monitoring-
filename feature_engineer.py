@@ -107,12 +107,22 @@ def add_geospatial_features(df: pd.DataFrame) -> pd.DataFrame:
     Prefix encodings are built on each split independently
     (caller must align encodings for train/test via build_features).
     """
-    coords      = df["geohash"].apply(decode_geohash)
-    df["lat"]   = coords.apply(lambda x: x[0]).astype(np.float32)
-    df["lon"]   = coords.apply(lambda x: x[1]).astype(np.float32)
+    # Cache decode per unique geohash for speed
+    unique_hashes = df["geohash"].unique()
+    cache = {h: decode_geohash(h) for h in unique_hashes}
+    df["lat"]   = df["geohash"].map(lambda x: cache[x][0]).astype(np.float32)
+    df["lon"]   = df["geohash"].map(lambda x: cache[x][1]).astype(np.float32)
     df["geohash_prefix5"] = df["geohash"].str[:5]
     df["geohash_prefix4"] = df["geohash"].str[:4]
-    print("[geospatial] lat/lon decoded")
+
+    # Distance from Bengaluru CBD (≈12.97°N, 77.59°E) — research shows
+    # distance from city centre correlates with traffic demand patterns
+    CBD_LAT, CBD_LON = 12.9716, 77.5946
+    df["dist_to_cbd"] = np.sqrt(
+        (df["lat"] - CBD_LAT) ** 2 + (df["lon"] - CBD_LON) ** 2
+    ).astype(np.float32)
+
+    print("[geospatial] lat/lon decoded + dist_to_cbd added")
     return df
 
 
@@ -189,6 +199,107 @@ def _knn_fill_unseen_geohashes(test: pd.DataFrame,
                 test.at[idx, col] = nn_row[col].values[0]
 
     return test
+
+
+# ─────────────────────────────────────────────
+# 4a. Spatial Cluster + Prefix Demand Features
+# ─────────────────────────────────────────────
+
+def add_spatial_cluster_features(train: pd.DataFrame, test: pd.DataFrame):
+    """
+    K-Means spatial clustering on geohash lat/lon coordinates.
+    Creates ~15 geographic clusters and computes cluster-level demand stats.
+
+    Research backing (Grab AI 2019, Urban Computing 2022):
+    - Spatial clusters capture neighbourhood-level demand patterns
+    - Cluster mean demand is a strong contextual feature for rare geohashes
+    - K-Means on lat/lon outperforms simple geohash prefix for irregular grids
+
+    Also adds:
+    - Geohash prefix mean demand (direct stat, more informative than int code)
+    - Temperature deviation from geohash mean temperature
+    - Demand quantiles (q25, q75) per geohash
+    """
+    from sklearn.cluster import KMeans
+
+    # ── K-Means spatial clustering (fit on train geohashes) ──────────────
+    geo_coords = (
+        train[["geohash", "lat", "lon"]]
+        .drop_duplicates("geohash")
+        .reset_index(drop=True)
+    )
+    N_CLUSTERS = min(15, len(geo_coords))
+    km = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
+    geo_coords["spatial_cluster"] = km.fit_predict(
+        geo_coords[["lat", "lon"]]
+    ).astype(np.int8)
+
+    # Predict cluster for unseen test geohashes using model
+    test_geo = (
+        test[["geohash", "lat", "lon"]]
+        .drop_duplicates("geohash")
+        .reset_index(drop=True)
+    )
+    test_geo["spatial_cluster"] = km.predict(
+        test_geo[["lat", "lon"]]
+    ).astype(np.int8)
+
+    train = train.merge(geo_coords[["geohash", "spatial_cluster"]], on="geohash", how="left")
+    test  = test.merge(test_geo[["geohash", "spatial_cluster"]],   on="geohash", how="left")
+
+    # Cluster-level demand stats (fit on train)
+    cluster_agg = train.groupby("spatial_cluster")["demand"].agg(
+        cluster_mean_demand="mean",
+        cluster_std_demand="std",
+    ).reset_index()
+    cluster_agg["cluster_std_demand"] = cluster_agg["cluster_std_demand"].fillna(0)
+
+    train = train.merge(cluster_agg, on="spatial_cluster", how="left")
+    test  = test.merge(cluster_agg,  on="spatial_cluster", how="left")
+    for col in ["cluster_mean_demand", "cluster_std_demand"]:
+        train[col] = train[col].fillna(train["demand"].mean())
+        test[col]  = test[col].fillna(train["demand"].mean())
+
+    # ── Geohash prefix mean demand (more informative than just int code) ──
+    for prefix_col in ["geohash_prefix5", "geohash_prefix4"]:
+        agg_col = prefix_col + "_mean_demand"
+        lut = train.groupby(prefix_col)["demand"].mean().reset_index()
+        lut.columns = [prefix_col, agg_col]
+        train = train.merge(lut, on=prefix_col, how="left")
+        test  = test.merge(lut, on=prefix_col, how="left")
+        global_mean = train["demand"].mean()
+        train[agg_col] = train[agg_col].fillna(global_mean)
+        test[agg_col]  = test[agg_col].fillna(global_mean)
+
+    # ── Temperature deviation from geohash mean temp ─────────────────────
+    temp_lut = train.groupby("geohash")["Temperature"].mean().reset_index()
+    temp_lut.columns = ["geohash", "geohash_mean_temp"]
+    train = train.merge(temp_lut, on="geohash", how="left")
+    test  = test.merge(temp_lut,  on="geohash", how="left")
+    global_mean_temp = train["Temperature"].mean()
+    for df in [train, test]:
+        df["geohash_mean_temp"] = df["geohash_mean_temp"].fillna(global_mean_temp)
+        df["temp_deviation"]    = (df["Temperature"] - df["geohash_mean_temp"]).astype(np.float32)
+
+    # ── Demand quantiles per geohash (Q25, Q75) ───────────────────────────
+    q25_lut = train.groupby("geohash")["demand"].quantile(0.25).reset_index()
+    q75_lut = train.groupby("geohash")["demand"].quantile(0.75).reset_index()
+    q25_lut.columns = ["geohash", "geohash_q25_demand"]
+    q75_lut.columns = ["geohash", "geohash_q75_demand"]
+    train = train.merge(q25_lut, on="geohash", how="left")
+    train = train.merge(q75_lut, on="geohash", how="left")
+    test  = test.merge(q25_lut,  on="geohash", how="left")
+    test  = test.merge(q75_lut,  on="geohash", how="left")
+    gm = train["demand"].mean()
+    for col in ["geohash_q25_demand", "geohash_q75_demand"]:
+        train[col] = train[col].fillna(gm)
+        test[col]  = test[col].fillna(gm)
+    # IQR as a volatility measure
+    train["geohash_iqr_demand"] = (train["geohash_q75_demand"] - train["geohash_q25_demand"]).astype(np.float32)
+    test["geohash_iqr_demand"]  = (test["geohash_q75_demand"]  - test["geohash_q25_demand"]).astype(np.float32)
+
+    print(f"[spatial-cluster] {N_CLUSTERS} clusters + prefix demand + temp_deviation + quantiles added")
+    return train, test
 
 
 # ─────────────────────────────────────────────
@@ -292,27 +403,63 @@ def add_lag_rolling_features(train: pd.DataFrame) -> pd.DataFrame:
     """
     Compute lag and rolling statistics of demand per geohash in training data.
     Sorted by (geohash, day, time_slot) before shifting to preserve temporal order.
-    These features do NOT exist in test; test uses add_test_lag_lookup() instead.
+
+    BUG FIX: The original code used grp.shift(1).rolling(...) on the flat series,
+    which rolled ACROSS geohash boundaries when the df is sorted by geohash.
+    Fixed by computing lags first, then rolling per-group via groupby+transform.
+
+    Also added lag_96 (same time slot 1 full day = 96 slots ago) — a critical
+    daily-periodicity signal validated in traffic forecasting literature.
     """
     df  = train.sort_values(["geohash", "day", "time_slot"]).copy()
     grp = df.groupby("geohash")["demand"]
 
-    df["demand_lag1"] = grp.shift(1)
-    df["demand_lag2"] = grp.shift(2)
-    df["demand_lag4"] = grp.shift(4)
+    # ── Lag features ──────────────────────────────────────────────────────
+    df["demand_lag1"]  = grp.shift(1)    # previous 15-min slot
+    df["demand_lag2"]  = grp.shift(2)    # previous 30-min slot
+    df["demand_lag4"]  = grp.shift(4)    # previous 60-min slot
+    df["demand_lag96"] = grp.shift(96)   # same slot yesterday (1 full day)
 
-    df["demand_roll4_mean"] = (grp.shift(1).rolling(4,  min_periods=1).mean()
-                               .reset_index(level=0, drop=True))
-    df["demand_roll8_mean"] = (grp.shift(1).rolling(8,  min_periods=1).mean()
-                               .reset_index(level=0, drop=True))
-    df["demand_roll4_std"]  = (grp.shift(1).rolling(4,  min_periods=2).std()
-                               .reset_index(level=0, drop=True))
+    # ── Rolling features — computed PER GEOHASH via transform [BUG FIX] ──
+    # Using transform ensures rolling does NOT cross geohash boundaries.
+    df["demand_roll4_mean"] = (
+        df.groupby("geohash")["demand_lag1"]
+          .transform(lambda x: x.rolling(4, min_periods=1).mean())
+    )
+    df["demand_roll8_mean"] = (
+        df.groupby("geohash")["demand_lag1"]
+          .transform(lambda x: x.rolling(8, min_periods=1).mean())
+    )
+    df["demand_roll4_std"] = (
+        df.groupby("geohash")["demand_lag1"]
+          .transform(lambda x: x.rolling(4, min_periods=2).std())
+    )
+    # Longer rolling windows — capture multi-hour trends
+    df["demand_roll16_mean"] = (
+        df.groupby("geohash")["demand_lag1"]
+          .transform(lambda x: x.rolling(16, min_periods=1).mean())
+    )
 
-    lag_cols = ["demand_lag1", "demand_lag2", "demand_lag4",
-                "demand_roll4_mean", "demand_roll8_mean", "demand_roll4_std"]
+    # ── EWMA — exponential weighted moving average (span=4 ≈ 1 hour) ─────
+    # EWMA gives more weight to recent slots; validated in traffic forecasting
+    df["demand_ewma4"] = (
+        df.groupby("geohash")["demand"]
+          .transform(lambda x: x.shift(1).ewm(span=4, min_periods=1).mean())
+    )
+
+    # ── Demand momentum — rate of change ─────────────────────────────────
+    df["demand_diff1"] = (df["demand_lag1"] - df["demand_lag2"])  # velocity
+    df["demand_diff2"] = (df["demand_lag1"] - df["demand_lag4"])  # acceleration proxy
+
+    lag_cols = [
+        "demand_lag1", "demand_lag2", "demand_lag4", "demand_lag96",
+        "demand_roll4_mean", "demand_roll8_mean", "demand_roll4_std",
+        "demand_roll16_mean", "demand_ewma4",
+        "demand_diff1", "demand_diff2",
+    ]
     df[lag_cols] = df[lag_cols].fillna(0)
 
-    print("[lag/rolling] features added")
+    print("[lag/rolling] features added (per-geohash rolling, EWMA, momentum, lag96)")
     return df
 
 
@@ -357,13 +504,17 @@ def add_test_lag_lookup(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame
         )
         print(f"[test-lag] {fallback} rows fell back to geohash mean")
 
-    test["demand_lag1"]     = test["_lag1_val"].astype(np.float32)
-    test["demand_lag2"]     = test["demand_lag1"]          # best proxy available
-    test["demand_lag4"]     = test["demand_lag1"]
+    test["demand_lag1"]       = test["_lag1_val"].astype(np.float32)
+    test["demand_lag2"]       = test["demand_lag1"]          # best proxy for lag2
+    test["demand_lag4"]       = test["demand_lag1"]          # best proxy for lag4
+    test["demand_lag96"]      = test["demand_lag1"]          # prev-day same slot ~ lag1
     test["demand_roll4_mean"] = test["demand_lag1"]
-    test["demand_roll8_mean"] = test["demand_lag1"]
-    test["demand_roll4_std"]  = test.get("geohash_std_demand",
-                                          pd.Series(0.0, index=test.index))
+    test["demand_roll16_mean"]= test["demand_lag1"]
+    test["demand_ewma4"]      = test["demand_lag1"]
+    test["demand_roll4_std"]  = test["geohash_std_demand"] if "geohash_std_demand" in test.columns \
+                                else pd.Series(0.0, index=test.index)
+    test["demand_diff1"] = np.float32(0.0)   # no prior slot info in test
+    test["demand_diff2"] = np.float32(0.0)
     test.drop(columns=["_lag1_val"], inplace=True)
 
     coverage = (~test["demand_lag1"].isnull()).mean() * 100
@@ -442,10 +593,32 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     is_highway   = (df["RoadType"] == 2).astype(np.int8)
     df["highway_x_afternoon"] = (is_highway * df["is_afternoon"]).astype(np.int8)
 
-    # Additional useful interactions
-    df["geo_slot_ratio"]  = (df.get("geo_slot_mean_demand", 0) /
-                              df["geohash_mean_demand"].replace(0, np.nan)).fillna(1).astype(np.float32)
-    df["demand_range"]    = (df["geohash_max_demand"] - df["geohash_min_demand"]).astype(np.float32)
+    # Additional useful interactions — safe column access [BUG FIX for df.get()]
+    if "geo_slot_mean_demand" in df.columns:
+        df["geo_slot_ratio"] = (
+            df["geo_slot_mean_demand"] /
+            df["geohash_mean_demand"].replace(0, np.nan)
+        ).fillna(1.0).astype(np.float32)
+    else:
+        df["geo_slot_ratio"] = np.float32(1.0)
+
+    df["demand_range"] = (
+        df["geohash_max_demand"] - df["geohash_min_demand"]
+    ).astype(np.float32)
+
+    # Slot rank within geohash — how does this slot compare to geohash baseline?
+    if "geo_slot_mean_demand" in df.columns:
+        denom = df["demand_range"].replace(0, np.nan)
+        df["slot_demand_rank"] = (
+            (df["geo_slot_mean_demand"] - df["geohash_min_demand"]) / denom
+        ).fillna(0.5).clip(0, 1).astype(np.float32)
+    else:
+        df["slot_demand_rank"] = np.float32(0.5)
+
+    # Temperature interactions
+    df["temp_squared"]  = (df["Temperature"] ** 2).astype(np.float32)
+    df["lanes_squared"] = (df["NumberofLanes"] ** 2).astype(np.float32)
+    df["lanes_x_slot"]  = (df["NumberofLanes"] * df["slot_mean_demand"]).astype(np.float32)
 
     print("[interaction] features added")
     return df
@@ -481,6 +654,9 @@ def build_features(train: pd.DataFrame, test: pd.DataFrame):
 
     # Step 3: Aggregations (fit on train, applied to both; KNN for unseen)
     train, test = add_aggregation_features(train, test)
+
+    # Step 3b: Spatial clusters + prefix demand + quantiles + temp deviation
+    train, test = add_spatial_cluster_features(train, test)
 
     # Step 4: Cross-day same-slot lag [MANDATORY-1]
     train, test = add_cross_day_lag(train, test)

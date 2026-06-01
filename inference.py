@@ -92,19 +92,42 @@ def run_inference(train_path: str  = DEFAULT_TRAIN_PATH,
     )
 
     # ── Step 5: Build Submission ──────────────────────────────────────────
+    # NOTE: Feature engineering merges (cross-day lag, spatial clusters, etc.)
+    # can change test row count. We build submission directly from the
+    # processed test Index column rather than the sample template.
     print("\n>>> Step 5: Building Submission")
-    submission = sample.copy()
-    submission["demand"] = pred_ensemble   # already inverted + clipped in run_training
+
+    # Get Index from the processed test DataFrame (source of truth for row IDs)
+    test_index_col = None
+    for col in ["Index", "index", "id", "ID"]:
+        if col in test.columns:
+            test_index_col = col
+            break
+
+    if test_index_col is not None and len(pred_ensemble) == len(test):
+        submission = pd.DataFrame({
+            test_index_col: test[test_index_col].values,
+            "demand":        pred_ensemble,
+        })
+    elif len(pred_ensemble) == len(sample):
+        # Predictions match sample template exactly
+        submission = sample.copy()
+        submission["demand"] = pred_ensemble
+    else:
+        # Fallback: build from test length
+        print(f"[warn] pred length={len(pred_ensemble)}, sample length={len(sample)}, "
+              f"test length={len(test)}. Using test-length index.")
+        submission = pd.DataFrame({"demand": pred_ensemble})
 
     # Sanity checks
     assert submission["demand"].isnull().sum() == 0, "NaN in submission!"
-    assert (submission["demand"] >= 0).all(),         "Negative demand in submission!"
-    assert (submission["demand"] <= 1).all(),          "Demand > 1 in submission!"
+    assert (submission["demand"] >= 0).all(),  "Negative demand in submission!"
+    assert (submission["demand"] <= 1).all(),  "Demand > 1 in submission!"
 
     sub_path = os.path.join(output_dir, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    print(f"\n[done] Submission saved → {sub_path}")
+    print(f"\n[done] Submission saved -> {sub_path}  (rows={len(submission)})")
     print(f"Prediction stats:\n{submission['demand'].describe().round(6)}")
     print("\n" + "="*60)
     return submission
